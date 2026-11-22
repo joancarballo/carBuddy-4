@@ -1,0 +1,249 @@
+// Sección "Calendario" de la web: listado de calendarios (cambiar nombre,
+// borrar y añadir otro en una ventana con las indicaciones de Google) y tabla
+// con los eventos de hoy y mañana.
+
+#include "services/TimeService.h"
+#include "services/calendar/CalendarService.h"
+#include "web/Sections.h"
+#include "web/Web.h"
+
+namespace {
+
+const char* HOW_TO =
+    "<ol>"
+    "<li>Abre Google Calendar en el ordenador (calendar.google.com).</li>"
+    "<li>Pulsa la rueda dentada y entra en <b>Configuración</b>.</li>"
+    "<li>A la izquierda, en <b>Configuración de mis calendarios</b>, elige tu calendario.</li>"
+    "<li>Baja hasta <b>Integrar el calendario</b>.</li>"
+    "<li>Copia la <b>Dirección secreta en formato iCal</b> (acaba en <i>basic.ics</i>) y pégala aquí.</li>"
+    "</ol>"
+    "<p>No compartas esa dirección: quien la tenga puede ver tu calendario. "
+    "Google puede tardar unas horas en reflejar los cambios en ella.</p>";
+
+String clockText(time_t t) {
+  struct tm tm;
+  localtime_r(&t, &tm);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  return String(buf);
+}
+
+String statusText(const CalendarService::Status& st) {
+  String text;
+  switch (st.state) {
+    case CalendarService::State::NoUrl:
+      return "Todavía no hay ningún calendario.";
+    case CalendarService::State::Waiting:
+      text = "Esperando a tener Wi-Fi y hora para descargar.";
+      break;
+    case CalendarService::State::Downloading:
+      text = "Descargando...";
+      break;
+    case CalendarService::State::Ok:
+      return "Última descarga: " + clockText(st.lastOk) + " (" + String(st.eventCount) +
+             " eventos entre hoy y mañana).";
+    case CalendarService::State::Error:
+      text = "Error al descargar: " + Web::htmlEscape(st.error) + ".";
+      break;
+  }
+  if (st.lastOk != 0) {
+    text += " Se muestran los datos de las " + clockText(st.lastOk) + ".";
+  }
+  return text;
+}
+
+// Tabla de los eventos de un día, como en la pantalla: los que ya han terminado
+// salen tachados. Con varios calendarios hay una columna con el de cada evento.
+String dayTable(const std::vector<CalendarEvent>& list, int64_t day, CivilTime::Minutes now, bool showCalendar) {
+  String html = "<table><tr><th>Hora</th><th>Evento</th>";
+  if (showCalendar) {
+    html += "<th>Calendario</th>";
+  }
+  html += "</tr>";
+
+  int count = 0;
+  for (size_t i = 0; i < list.size(); i++) {
+    const CalendarEvent& e = list[i];
+    if (e.day != day) {
+      continue;
+    }
+    html += e.end <= now ? "<tr class=\"past\">" : "<tr>";
+    html += "<td>" + String(timeRangeText(e).c_str()) + "</td>";
+    html += "<td>" + Web::htmlEscape(e.title.c_str()) + "</td>";
+    if (showCalendar) {
+      html += "<td>" + Web::htmlEscape(e.calendar.c_str()) + "</td>";
+    }
+    html += "</tr>";
+    count++;
+  }
+  if (count == 0) {
+    html += "<tr><td colspan=\"3\" class=\"muted\">Sin eventos</td></tr>";
+  }
+  return html + "</table>";
+}
+
+// "Previsualización", con el botón "Actualizar ahora" al lado del título.
+// Mientras se descargan los calendarios muestra "Cargando eventos" con la
+// animación de puntos; si no, las tablas de hoy y mañana.
+String preview(const CalendarService::Status& st, bool showCalendar) {
+  String html =
+      "<div class=\"row\"><h3>Previsualización</h3>"
+      "<form method=\"POST\" action=\"/calendar/refresh\"><button type=\"submit\" class=\"small\">Actualizar ahora</button></form>"
+      "</div>";
+
+  if (st.state == CalendarService::State::Downloading) {
+    return html + "<p class=\"muted\">Cargando eventos" + Web::waitingDots() + "</p>";
+  }
+  if (st.state == CalendarService::State::Waiting) {
+    return html + "<p class=\"muted\">Esperando Wi-Fi y hora" + Web::waitingDots() + "</p>";
+  }
+
+  struct tm t;
+  if (st.lastOk == 0 || !TimeService::now(t)) {
+    return html + "<p class=\"muted\">Todavía no hay eventos descargados.</p>";
+  }
+  const CivilTime::Minutes now = CivilTime::fromTm(t);
+  const int64_t today = CivilTime::dayOf(now);
+  const std::vector<CalendarEvent> list = CalendarService::events();
+
+  html += "<h4>Hoy</h4>" + dayTable(list, today, now, showCalendar);
+  html += "<h4>Mañana</h4>" + dayTable(list, today + 1, now, showCalendar);
+  return html;
+}
+
+// Mientras descarga, la página pregunta el estado cada 2 s y se recarga al terminar.
+const char* RELOAD_WHEN_DONE =
+    "<script>setInterval(function(){fetch('/calendar/status')"
+    ".then(function(r){return r.text()})"
+    ".then(function(s){if(s=='ok'||s=='error'){location.reload();}});},2000);</script>";
+
+// Ventana para añadir un calendario: nombre, URL e indicaciones de Google.
+// Las URL guardadas no se muestran nunca: son secretas. Al escribirla tampoco
+// se ve (campo de contraseña) y se pide al navegador que no la recuerde.
+String addDialog() {
+  return Web::dialogForm("add-cal", "Añadir un calendario", "/calendar/add",
+                         String("<p>Nombre (opcional):<br><input name=\"name\" maxlength=\"24\" placeholder=\"Personal\"></p>"
+                                "<p>URL iCal privada:<br><input name=\"url\" type=\"password\" required "
+                                "autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\" "
+                                "placeholder=\"https://calendar.google.com/calendar/ical/.../basic.ics\"></p>"
+                                "<h3>Cómo conseguir la URL en Google Calendar</h3>") +
+                             HOW_TO);
+}
+
+// Ventana para cambiar el nombre de un calendario, con el nombre actual escrito.
+String renameDialog(size_t index, const String& escapedName) {
+  return Web::dialogForm("rn-" + String(index), "Editar nombre", "/calendar/rename",
+                         "<input type=\"hidden\" name=\"i\" value=\"" + String(index) + "\">"
+                         "<p>Nombre del calendario:<br><input name=\"name\" maxlength=\"24\" required value=\"" +
+                             escapedName + "\"></p>");
+}
+
+// Listado de calendarios: nombre y estado, y en la misma línea los botones
+// pequeños para cambiar el nombre (abre su ventana) y borrarlo. Al final, el
+// botón que abre la ventana para añadir otro.
+String calendarList(const std::vector<CalendarService::CalendarInfo>& cals) {
+  String html = "<ul class=\"cals\">";
+  for (size_t i = 0; i < cals.size(); i++) {
+    const String name = Web::htmlEscape(cals[i].name);
+    const String index = "<input type=\"hidden\" name=\"i\" value=\"" + String(i) + "\">";
+
+    html += "<li class=\"cal\"><span class=\"grow\"><b>" + name + "</b> · ";
+    if (cals[i].error.length() > 0) {
+      html += "error (" + Web::htmlEscape(cals[i].error) + ")";
+    } else {
+      html += String(cals[i].eventCount) + " eventos hoy y mañana";
+    }
+    html += "</span>";
+    html += Web::openDialogButton("rn-" + String(i), "Editar nombre");
+    html += "<form method=\"POST\" action=\"/calendar/delete\" data-n=\"" + name +
+            "\" onsubmit=\"return confirm('¿Borrar el calendario '+this.dataset.n+'?')\">" + index +
+            "<button type=\"submit\" class=\"small danger\">Borrar calendario</button></form></li>";
+  }
+
+  html += "<li class=\"cal\">";
+  if ((int)cals.size() < CalendarService::MAX_CALENDARS) {
+    html += Web::openDialogButton("add-cal", cals.empty() ? "+ Añadir un calendario" : "+ Añadir otro calendario");
+  } else {
+    html += "<span class=\"muted\">Máximo de " + String(CalendarService::MAX_CALENDARS) +
+            " calendarios. Borra uno para añadir otro.</span>";
+  }
+  html += "</li></ul>";
+  return html;
+}
+
+}  // namespace
+
+namespace CalendarSection {
+
+String html() {
+  const CalendarService::Status st = CalendarService::status();
+  const std::vector<CalendarService::CalendarInfo> cals = CalendarService::calendars();
+
+  String html;
+  html.reserve(6144);
+  html += "<h2 id=\"calendario\">Calendario</h2>";
+  html += "<p>" + statusText(st) + "</p>";
+  html += calendarList(cals);
+  if (!cals.empty()) {
+    html += preview(st, cals.size() > 1);
+  }
+  html += addDialog();
+  for (size_t i = 0; i < cals.size(); i++) {
+    html += renameDialog(i, Web::htmlEscape(cals[i].name));
+  }
+
+  if (st.state == CalendarService::State::Downloading || st.state == CalendarService::State::Waiting) {
+    html += RELOAD_WHEN_DONE;
+  }
+  return html;
+}
+
+void registerRoutes() {
+  Web::server().on("/calendar/add", HTTP_POST, []() {
+    WebServer& s = Web::server();
+    String name = s.arg("name");
+    String url = s.arg("url");
+    name.trim();
+    url.trim();
+    // Google a veces da la dirección como webcal://, que es lo mismo por HTTPS.
+    if (url.startsWith("webcal://")) {
+      url = "https://" + url.substring(9);
+    }
+    if (!url.startsWith("https://")) {
+      s.send(400, "text/plain; charset=utf-8", "La URL tiene que empezar por https://");
+      return;
+    }
+    if (!CalendarService::addCalendar(name.substring(0, 24), url)) {
+      s.send(400, "text/plain; charset=utf-8", "Ya está el máximo de calendarios");
+      return;
+    }
+    Web::redirectHome("calendario");
+  });
+
+  Web::server().on("/calendar/rename", HTTP_POST, []() {
+    String name = Web::server().arg("name");
+    name.trim();
+    if (name.length() > 0) {
+      CalendarService::renameCalendar(Web::server().arg("i").toInt(), name.substring(0, 24));
+    }
+    Web::redirectHome("calendario");
+  });
+
+  Web::server().on("/calendar/delete", HTTP_POST, []() {
+    CalendarService::removeCalendar(Web::server().arg("i").toInt());
+    Web::redirectHome("calendario");
+  });
+
+  Web::server().on("/calendar/refresh", HTTP_POST, []() {
+    CalendarService::refreshNow();
+    Web::redirectHome("calendario");
+  });
+
+  // Estado para el script de la página: "nourl", "waiting", "downloading", "ok" o "error".
+  Web::server().on("/calendar/status", HTTP_GET, []() {
+    static const char* const NAMES[] = {"nourl", "waiting", "downloading", "ok", "error"};
+    Web::server().send(200, "text/plain", NAMES[(int)CalendarService::status().state]);
+  });
+}
+
+}  // namespace CalendarSection
